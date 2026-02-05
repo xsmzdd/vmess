@@ -14,10 +14,25 @@ is_port_valid() {
 }
 
 is_username_valid() {
-  # 允许大小写字母+数字+下划线+短横线；长度 1-31；首字符必须是字母或下划线
-  # 注意：部分发行版 useradd 可能默认不喜欢大写用户名，所以创建时使用 --force-badname
+  # 允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度 1-31
   local u="$1"
   [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
+}
+
+useradd_allow_badname() {
+  # 兼容不同发行版的 useradd 参数：
+  # - 有的支持 --force-badname
+  # - 有的支持 --badnames（你这台就是）
+  local user="$1"
+
+  if useradd --help 2>&1 | grep -q -- '--force-badname'; then
+    useradd --force-badname -m -s /usr/sbin/nologin "$user"
+  elif useradd --help 2>&1 | grep -q -- '--badnames'; then
+    useradd --badnames -m -s /usr/sbin/nologin "$user"
+  else
+    # 都不支持就按默认创建（大概率会拒绝“坏名字”，但正常名字可用）
+    useradd -m -s /usr/sbin/nologin "$user"
+  fi
 }
 
 need_root
@@ -39,7 +54,7 @@ if ! is_username_valid "$USERNAME"; then
   exit 1
 fi
 
-# 密码不回显，输入两次确认（允许大小写和数字，实际上脚本不限制字符集，只要非空且两次一致即可）
+# 密码不回显，输入两次确认（允许大小写和数字；脚本不限制字符集，只要非空且两次一致）
 read -rsp "请输入 SOCKS5 密码（不回显，支持大小写和数字）: " PASSWORD
 echo
 if [[ -z "${PASSWORD}" ]]; then
@@ -86,8 +101,7 @@ echo "[3/6] 创建/更新系统用户并设置密码 ..."
 if id -u "$USERNAME" >/dev/null 2>&1; then
   echo "用户已存在：$USERNAME（将重置密码）"
 else
-  # 允许大写/“非标准”用户名
-  useradd --force-badname -m -s /usr/sbin/nologin "$USERNAME"
+  useradd_allow_badname "$USERNAME"
   echo "已创建用户：$USERNAME"
 fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
