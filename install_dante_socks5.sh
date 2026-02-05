@@ -13,11 +13,6 @@ is_port_valid() {
   [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
-rand_alpha12() {
-  # 12 位随机大小写英文字母
-  LC_ALL=C tr -dc 'A-Za-z' </dev/urandom | head -c 12
-}
-
 need_root
 
 echo "=== Dante SOCKS5 安装脚本（随机用户名/密码，适用于容器/无 systemd）==="
@@ -28,8 +23,11 @@ if ! is_port_valid "$PORT"; then
   exit 1
 fi
 
-USERNAME="socks$(rand_alpha12 | tr 'A-Z' 'a-z' | head -c 8)"
-PASSWORD="$(rand_alpha12)"
+# ✅ 修复点：避免嵌套 head/管道导致 pipefail 退出
+# 用户名：socks + 8位小写字母（更适合作为系统用户名）
+USERNAME="socks$(LC_ALL=C tr -dc 'a-z' </dev/urandom | head -c 8)"
+# 密码：12位随机大小写英文字母
+PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z' </dev/urandom | head -c 12)"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -61,14 +59,15 @@ pass {
 EOF
 
 echo "[3/6] 创建系统用户并设置随机密码 ..."
-# 若意外重名则重新生成
+# 若意外重名则重新生成（极低概率）
 for _ in {1..10}; do
   if id -u "$USERNAME" >/dev/null 2>&1; then
-    USERNAME="socks$(rand_alpha12 | tr 'A-Z' 'a-z' | head -c 8)"
+    USERNAME="socks$(LC_ALL=C tr -dc 'a-z' </dev/urandom | head -c 8)"
   else
     break
   fi
 done
+
 id -u "$USERNAME" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin "$USERNAME"
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
@@ -86,10 +85,6 @@ LISTEN_OK="no"
 if ss -lntp 2>/dev/null | grep -q ":${PORT}\b"; then
   LISTEN_OK="yes"
 fi
-
-# 获取容器内 IP（可选显示）
-IP_IN_CONTAINER="$(hostname -I 2>/dev/null | awk '{print $1}')"
-IP_IN_CONTAINER="${IP_IN_CONTAINER:-127.0.0.1}"
 
 echo
 echo "================= SOCKS5 搭建完成 ================="
