@@ -107,7 +107,7 @@ fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
 echo "[4/6] 校验配置 ..."
-danted -t -f /etc/danted.conf
+danted -V -f /etc/danted.conf
 
 echo "[5/6] 启动 danted（不使用 systemctl）..."
 pkill danted >/dev/null 2>&1 || true
