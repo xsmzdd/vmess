@@ -16,7 +16,7 @@ is_port_valid() {
 is_username_valid() {
   # Linux 用户名建议：字母/下划线开头，后续字母数字下划线短横线（长度<=31）
   local u="$1"
-  [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
+  [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
 }
 
 need_root
