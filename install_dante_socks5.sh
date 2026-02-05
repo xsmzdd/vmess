@@ -14,7 +14,8 @@ is_port_valid() {
 }
 
 is_username_valid() {
-  # Linux 用户名建议：字母/下划线开头，后续字母数字下划线短横线（长度<=31）
+  # 允许大小写字母+数字+下划线+短横线；长度 1-31；首字符必须是字母或下划线
+  # 注意：部分发行版 useradd 可能默认不喜欢大写用户名，所以创建时使用 --force-badname
   local u="$1"
   [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
 }
@@ -30,16 +31,16 @@ if ! is_port_valid "$PORT"; then
   exit 1
 fi
 
-read -rp "请输入 SOCKS5 用户名（将创建为系统用户，如 socksuser）[socksuser]: " USERNAME
+read -rp "请输入 SOCKS5 用户名（支持大小写和数字，如 User01）[socksuser]: " USERNAME
 USERNAME="${USERNAME:-socksuser}"
 if ! is_username_valid "$USERNAME"; then
   echo "用户名不合法：$USERNAME"
-  echo "建议格式：字母/下划线开头，后续仅 a-z 0-9 _ - ，总长度<=31"
+  echo "允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度<=31"
   exit 1
 fi
 
-# 密码不回显，输入两次确认
-read -rsp "请输入 SOCKS5 密码（不回显）: " PASSWORD
+# 密码不回显，输入两次确认（允许大小写和数字，实际上脚本不限制字符集，只要非空且两次一致即可）
+read -rsp "请输入 SOCKS5 密码（不回显，支持大小写和数字）: " PASSWORD
 echo
 if [[ -z "${PASSWORD}" ]]; then
   echo "密码不能为空"
@@ -85,7 +86,8 @@ echo "[3/6] 创建/更新系统用户并设置密码 ..."
 if id -u "$USERNAME" >/dev/null 2>&1; then
   echo "用户已存在：$USERNAME（将重置密码）"
 else
-  useradd -m -s /usr/sbin/nologin "$USERNAME"
+  # 允许大写/“非标准”用户名
+  useradd --force-badname -m -s /usr/sbin/nologin "$USERNAME"
   echo "已创建用户：$USERNAME"
 fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
