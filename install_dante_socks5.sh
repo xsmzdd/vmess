@@ -19,22 +19,6 @@ is_username_valid() {
   [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
 }
 
-useradd_allow_badname() {
-  # 兼容不同发行版的 useradd 参数：
-  # - 有的支持 --force-badname
-  # - 有的支持 --badnames（你这台就是）
-  local user="$1"
-
-  if useradd --help 2>&1 | grep -q -- '--force-badname'; then
-    useradd --force-badname -m -s /usr/sbin/nologin "$user"
-  elif useradd --help 2>&1 | grep -q -- '--badnames'; then
-    useradd --badnames -m -s /usr/sbin/nologin "$user"
-  else
-    # 都不支持就按默认创建（大概率会拒绝“坏名字”，但正常名字可用）
-    useradd -m -s /usr/sbin/nologin "$user"
-  fi
-}
-
 need_root
 
 echo "=== Dante SOCKS5 安装脚本（手动输入账号密码，适用于容器/无 systemd）==="
@@ -54,7 +38,6 @@ if ! is_username_valid "$USERNAME"; then
   exit 1
 fi
 
-# 密码不回显，输入两次确认（允许大小写和数字；脚本不限制字符集，只要非空且两次一致）
 read -rsp "请输入 SOCKS5 密码（不回显，支持大小写和数字）: " PASSWORD
 echo
 if [[ -z "${PASSWORD}" ]]; then
@@ -70,16 +53,26 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-echo "[1/6] 安装 dante-server / iproute2 / curl ..."
+echo "[1/7] 安装 dante-server / iproute2 / curl ..."
 apt-get update -y
 apt-get install -y dante-server iproute2 curl
 
-echo "[2/6] 写入 /etc/danted.conf (TCP+UDP, username 认证) ..."
+echo "[2/7] 检测 eth0 IPv4 地址（用于 external 绑定）..."
+IP="$(ip -4 addr show dev eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1 || true)"
+echo "$IP"
+if [[ -z "${IP}" ]]; then
+  echo "未能检测到 eth0 的 IPv4 地址（external 不能用 0.0.0.0），请检查：ip -4 addr show dev eth0"
+  exit 1
+fi
+
+echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证) ..."
 cat >/etc/danted.conf <<EOF
 logoutput: stdout
 
+# 对外监听端口（容器内通常用 0.0.0.0）
 internal: 0.0.0.0 port = ${PORT}
-external: 0.0.0.0
+# 出口绑定必须是具体地址/接口，这里使用检测到的 eth0 IPv4
+external: ${IP}
 
 method: username
 user.privileged: root
@@ -97,25 +90,31 @@ pass {
 }
 EOF
 
-echo "[3/6] 创建/更新系统用户并设置密码 ..."
+echo "[4/7] 创建/更新系统用户并设置密码 ..."
 if id -u "$USERNAME" >/dev/null 2>&1; then
   echo "用户已存在：$USERNAME（将重置密码）"
 else
-  useradd_allow_badname "$USERNAME"
+  # 你的环境 useradd 支持 --badnames（不支持 --force-badname）
+  if useradd --help 2>&1 | grep -q -- '--badnames'; then
+    useradd --badnames -m -s /usr/sbin/nologin "$USERNAME"
+  else
+    useradd -m -s /usr/sbin/nologin "$USERNAME"
+  fi
   echo "已创建用户：$USERNAME"
 fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
-echo "[4/6] 校验配置 ..."
+echo "[5/7] 校验配置 ..."
+# 你这版 danted 用 -V 校验（不支持 -t）
 danted -V -f /etc/danted.conf
 
-echo "[5/6] 启动 danted（不使用 systemctl）..."
+echo "[6/7] 启动 danted（不使用 systemctl）..."
 pkill danted >/dev/null 2>&1 || true
 nohup danted -f /etc/danted.conf -D >/var/log/danted.log 2>&1 &
 
 sleep 0.8
 
-echo "[6/6] 检测监听 ..."
+echo "[7/7] 检测监听 ..."
 LISTEN_OK="no"
 if ss -lntp 2>/dev/null | grep -q ":${PORT}\b"; then
   LISTEN_OK="yes"
@@ -125,6 +124,7 @@ echo
 echo "================= SOCKS5 搭建完成 ================="
 echo "协议: SOCKS5 (Dante)"
 echo "监听端口: ${PORT}"
+echo "external 出口IP: ${IP}"
 echo "用户名: ${USERNAME}"
 echo "密码: ${PASSWORD}"
 echo "UDP: 已允许 (外部使用需映射/放行 UDP 端口)"
