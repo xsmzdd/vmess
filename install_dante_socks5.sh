@@ -20,13 +20,37 @@ is_username_valid() {
 }
 
 detect_default_iface() {
-  # 从默认路由中拿 dev
   ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
 detect_iface_ipv4() {
   local iface="$1"
   ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1
+}
+
+kill_port_listeners() {
+  local port="$1"
+  # 找出监听该端口的 PID 并 kill
+  local pids=""
+  if command -v ss >/dev/null 2>&1; then
+    # ss 输出里 users:(("proc",pid=123,fd=...))
+    pids="$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
+  fi
+
+  if [[ -n "${pids}" ]]; then
+    echo "检测到端口 ${port} 已被占用，尝试停止占用进程 PID: ${pids}"
+    # 先温柔一点
+    kill ${pids} >/dev/null 2>&1 || true
+    sleep 0.5
+    # 仍存在则强杀
+    local still=""
+    still="$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u || true)"
+    if [[ -n "${still}" ]]; then
+      echo "端口仍被占用，强制结束 PID: ${still}"
+      kill -9 ${still} >/dev/null 2>&1 || true
+      sleep 0.3
+    fi
+  fi
 }
 
 need_root
@@ -83,24 +107,38 @@ fi
 echo "默认网卡: ${IFACE}"
 echo "IPv4: ${IP}"
 
-echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证；取消日志) ..."
+echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证；新语法；取消日志) ..."
 cat >/etc/danted.conf <<EOF
-# 对外监听端口（容器内通常用 0.0.0.0）
+# Listen on all interfaces
 internal: 0.0.0.0 port = ${PORT}
-# 出口绑定必须是具体地址/接口，这里使用默认路由网卡的 IPv4
+
+# Outgoing bind
 external: ${IP}
 
-method: username
+# Authentication (new keyword)
+socksmethod: username
+clientmethod: none
+
 user.privileged: root
 user.notprivileged: nobody
 
+# Client rules
 client pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
 }
 
-pass {
+client block {
   from: 0.0.0.0/0 to: 0.0.0.0/0
-  protocol: tcp udp
+}
+
+# SOCKS rules (new block name)
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  command: connect bind udpassociate
+}
+
+socks block {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
 }
 EOF
 
@@ -108,7 +146,6 @@ echo "[4/7] 创建/更新系统用户并设置密码 ..."
 if id -u "$USERNAME" >/dev/null 2>&1; then
   echo "用户已存在：$USERNAME（将重置密码）"
 else
-  # 你的环境 useradd 支持 --badnames（不支持 --force-badname）
   if useradd --help 2>&1 | grep -q -- '--badnames'; then
     useradd --badnames -m -s /usr/sbin/nologin "$USERNAME"
   else
@@ -119,13 +156,16 @@ fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
 echo "[5/7] 校验配置 ..."
-# 你这版 danted 用 -V 校验（不支持 -t）
 danted -V -f /etc/danted.conf
 
-echo "[6/7] 启动 danted（不使用 systemctl；取消日志输出重定向）..."
+echo "[6/7] 启动 danted（不使用 systemctl；取消日志）..."
+# 先停掉可能存在的 danted
 pkill danted >/dev/null 2>&1 || true
 
-# -D 后台运行；不再 nohup 重定向到 /var/log
+# 再确保端口不被占用（哪怕是别的进程）
+kill_port_listeners "${PORT}"
+
+# 后台启动
 danted -f /etc/danted.conf -D
 
 sleep 0.8
