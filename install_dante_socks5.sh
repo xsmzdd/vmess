@@ -1,151 +1,140 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# Dante SOCKS5 installer (auto detect default NIC) - NO LOG
-# =========================
-
-SOCKS_PORT="${SOCKS_PORT:-1080}"
-SOCKS_USER="${SOCKS_USER:-socksuser}"
-ALLOW_CIDR="${ALLOW_CIDR:-0.0.0.0/0}"  # 建议改成你的固定IP/网段更安全
-
-die() { echo "ERROR: $*" >&2; exit 1; }
-
 need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    die "请用 root 运行：sudo bash $0"
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "请用 root 运行：sudo bash $0"
+    exit 1
   fi
 }
 
-detect_default_iface() {
-  local iface
-  iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  [[ -n "${iface}" ]] || die "无法检测默认网卡（default route）。请检查：ip -4 route"
-  echo "${iface}"
+is_port_valid() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
-detect_iface_ipv4() {
-  local iface="$1"
-  local ip4
-  ip4="$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  [[ -n "${ip4}" ]] || die "无法获取网卡 ${iface} 的 IPv4 地址。请检查：ip -4 addr show dev ${iface}"
-  echo "${ip4}"
+is_username_valid() {
+  # 允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度 1-31
+  local u="$1"
+  [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
 }
 
-install_pkgs() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y dante-server iproute2 curl
-}
+need_root
 
-ensure_user() {
-  local user="$1"
-  if ! id -u "${user}" >/dev/null 2>&1; then
-    useradd -r -s /usr/sbin/nologin -m "${user}"
-  fi
-}
+echo "=== Dante SOCKS5 安装脚本（手动输入账号密码，适用于容器/无 systemd）==="
 
-write_config() {
-  local iface="$1"
-  local ip4="$2"
+read -rp "请输入 SOCKS5 端口 (1-65535) [44855]: " PORT
+PORT="${PORT:-44855}"
+if ! is_port_valid "$PORT"; then
+  echo "端口不合法：$PORT"
+  exit 1
+fi
 
-  # 注意：本脚本“取消日志功能”，不会写 logoutput，也不会创建任何日志文件
-  cat > /etc/danted.conf <<EOF
-# Listen on all interfaces for incoming SOCKS connections
-internal: 0.0.0.0 port = ${SOCKS_PORT}
+read -rp "请输入 SOCKS5 用户名（支持大小写和数字，如 User01）[socksuser]: " USERNAME
+USERNAME="${USERNAME:-socksuser}"
+if ! is_username_valid "$USERNAME"; then
+  echo "用户名不合法：$USERNAME"
+  echo "允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度<=31"
+  exit 1
+fi
 
-# Outgoing interface (MUST NOT be 0.0.0.0)
-external: ${iface}
+read -rsp "请输入 SOCKS5 密码（不回显，支持大小写和数字）: " PASSWORD
+echo
+if [[ -z "${PASSWORD}" ]]; then
+  echo "密码不能为空"
+  exit 1
+fi
+read -rsp "请再次输入密码确认: " PASSWORD2
+echo
+if [[ "${PASSWORD}" != "${PASSWORD2}" ]]; then
+  echo "两次输入的密码不一致"
+  exit 1
+fi
 
-# Authentication
-socksmethod: username
-clientmethod: none
+export DEBIAN_FRONTEND=noninteractive
 
-# Detected IPv4 on ${iface}: ${ip4}
+echo "[1/7] 安装 dante-server / iproute2 / curl ..."
+apt-get update -y
+apt-get install -y dante-server iproute2 curl
 
-# Privileges
+echo "[2/7] 检测 eth0 IPv4 地址（用于 external 绑定）..."
+IP="$(ip -4 addr show dev eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1 || true)"
+echo "$IP"
+if [[ -z "${IP}" ]]; then
+  echo "未能检测到 eth0 的 IPv4 地址（external 不能用 0.0.0.0），请检查：ip -4 addr show dev eth0"
+  exit 1
+fi
+
+echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证) ..."
+cat >/etc/danted.conf <<EOF
+logoutput: stdout
+
+# 对外监听端口（容器内通常用 0.0.0.0）
+internal: 0.0.0.0 port = ${PORT}
+# 出口绑定必须是具体地址/接口，这里使用检测到的 eth0 IPv4
+external: ${IP}
+
+method: username
 user.privileged: root
 user.notprivileged: nobody
 
-# DNS
-resolveprotocol: udp
-
-# Client rules (who can connect to the daemon)
 client pass {
-  from: ${ALLOW_CIDR} to: 0.0.0.0/0
-}
-
-client block {
   from: 0.0.0.0/0 to: 0.0.0.0/0
+  log: connect disconnect error
 }
 
-# SOCKS rules (what connected clients may do)
-socks pass {
-  from: ${ALLOW_CIDR} to: 0.0.0.0/0
-  command: connect bind udpassociate
-}
-
-socks block {
+pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
+  protocol: tcp udp
+  log: connect disconnect error
 }
 EOF
-}
 
-restart_service() {
-  systemctl enable danted >/dev/null 2>&1 || true
-  systemctl restart danted
-  systemctl --no-pager --full status danted || true
-}
+echo "[4/7] 创建/更新系统用户并设置密码 ..."
+if id -u "$USERNAME" >/dev/null 2>&1; then
+  echo "用户已存在：$USERNAME（将重置密码）"
+else
+  # 你的环境 useradd 支持 --badnames（不支持 --force-badname）
+  if useradd --help 2>&1 | grep -q -- '--badnames'; then
+    useradd --badnames -m -s /usr/sbin/nologin "$USERNAME"
+  else
+    useradd -m -s /usr/sbin/nologin "$USERNAME"
+  fi
+  echo "已创建用户：$USERNAME"
+fi
+echo "${USERNAME}:${PASSWORD}" | chpasswd
 
-quick_test() {
-  local port="$1"
-  echo
-  echo "====== Quick test (curl via socks5) ======"
-  echo "如果你已经创建了账号密码，可用："
-  echo "  curl --socks5-hostname ${SOCKS_USER}:<PASSWORD>@127.0.0.1:${port} https://ifconfig.me"
-  echo
-  echo "当前监听端口检查："
-  ss -lntp | grep -E ":${port}\b" || true
-  echo "========================================="
-}
+echo "[5/7] 校验配置 ..."
+# 你这版 danted 用 -V 校验（不支持 -t）
+danted -V -f /etc/danted.conf
 
-main() {
-  need_root
+echo "[6/7] 启动 danted（不使用 systemctl）..."
+pkill danted >/dev/null 2>&1 || true
+nohup danted -f /etc/danted.conf -D >/var/log/danted.log 2>&1 &
 
-  echo "[1/6] 安装依赖与 dante-server..."
-  install_pkgs
+sleep 0.8
 
-  echo "[2/6] 自动识别默认出口网卡..."
-  local iface
-  iface="$(detect_default_iface)"
-  echo "默认网卡: ${iface}"
+echo "[7/7] 检测监听 ..."
+LISTEN_OK="no"
+if ss -lntp 2>/dev/null | grep -q ":${PORT}\b"; then
+  LISTEN_OK="yes"
+fi
 
-  echo "[3/6] 获取默认网卡 IPv4..."
-  local ip4
-  ip4="$(detect_iface_ipv4 "${iface}")"
-  echo "网卡 ${iface} IPv4: ${ip4}"
-
-  echo "[4/6] 创建服务账号（用于提示/示例；认证走 PAM）..."
-  ensure_user "${SOCKS_USER}"
-
-  echo "[5/6] 写入 /etc/danted.conf（external 使用默认网卡名；不配置日志）..."
-  write_config "${iface}" "${ip4}"
-
-  echo "[6/6] 启用并启动 danted..."
-  restart_service
-
-  echo
-  echo "✅ 完成。配置摘要："
-  echo "  - internal: 0.0.0.0:${SOCKS_PORT}"
-  echo "  - external: ${iface}"
-  echo "  - allow CIDR: ${ALLOW_CIDR}"
-  echo "  - config: /etc/danted.conf"
-  echo "  - log: (disabled)"
-  echo
-  echo "⚠️ 重要：你需要为系统用户设置密码（用于 SOCKS5 账号密码认证）："
-  echo "  passwd ${SOCKS_USER}"
-  echo
-  quick_test "${SOCKS_PORT}"
-}
-
-main "$@"
+echo
+echo "================= SOCKS5 搭建完成 ================="
+echo "协议: SOCKS5 (Dante)"
+echo "监听端口: ${PORT}"
+echo "external 出口IP: ${IP}"
+echo "用户名: ${USERNAME}"
+echo "密码: ${PASSWORD}"
+echo "UDP: 已允许 (外部使用需映射/放行 UDP 端口)"
+echo "监听状态: ${LISTEN_OK}"
+echo
+echo "容器内测试："
+echo "  curl -v --socks5-hostname ${USERNAME}:${PASSWORD}@127.0.0.1:${PORT} https://ifconfig.me"
+echo
+echo "日志查看："
+echo "  tail -n 200 /var/log/danted.log"
+echo "停止："
+echo "  pkill danted"
+echo "===================================================="
