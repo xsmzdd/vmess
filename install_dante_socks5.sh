@@ -1,195 +1,150 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# 一键安装 SOCKS5 (Dante) - 支持 Debian/Ubuntu & Alpine
+# 功能:
+#   - 让你输入端口
+#   - 自动生成随机用户名和12位大小写密码
+#   - 启用 UDP
+#   - 配置并启动 danted 服务
 
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "请用 root 运行：sudo bash $0"
-    exit 1
-  fi
-}
+set -e
 
-is_port_valid() {
-  local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
-}
+# 必须用 root
+if [ "$EUID" -ne 0 ]; then
+  echo "请用 root 权限运行此脚本！例如：sudo bash $0"
+  exit 1
+fi
 
-is_username_valid() {
-  # 允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度 1-31
-  local u="$1"
-  [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
-}
+if [ ! -f /etc/os-release ]; then
+  echo "无法识别系统类型（缺少 /etc/os-release）"
+  exit 1
+fi
 
-detect_default_iface() {
-  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
-}
+. /etc/os-release
 
-detect_iface_ipv4() {
-  local iface="$1"
-  ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1
-}
+echo "检测到系统: $ID"
 
-kill_port_listeners() {
-  local port="$1"
-  # 找出监听该端口的 PID 并 kill
-  local pids=""
-  if command -v ss >/dev/null 2>&1; then
-    # ss 输出里 users:(("proc",pid=123,fd=...))
-    pids="$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
-  fi
-
-  if [[ -n "${pids}" ]]; then
-    echo "检测到端口 ${port} 已被占用，尝试停止占用进程 PID: ${pids}"
-    # 先温柔一点
-    kill ${pids} >/dev/null 2>&1 || true
-    sleep 0.5
-    # 仍存在则强杀
-    local still=""
-    still="$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u || true)"
-    if [[ -n "${still}" ]]; then
-      echo "端口仍被占用，强制结束 PID: ${still}"
-      kill -9 ${still} >/dev/null 2>&1 || true
-      sleep 0.3
-    fi
-  fi
-}
-
-need_root
-
-echo "=== Dante SOCKS5 安装脚本（手动输入账号密码，适用于容器/无 systemd）==="
-
-read -rp "请输入 SOCKS5 端口 (1-65535) [44855]: " PORT
-PORT="${PORT:-44855}"
-if ! is_port_valid "$PORT"; then
+# 读端口
+read -p "请输入 SOCKS5 端口(1-65535): " PORT
+if ! echo "$PORT" | grep -Eq '^[0-9]+$' || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   echo "端口不合法：$PORT"
   exit 1
 fi
 
-read -rp "请输入 SOCKS5 用户名（支持大小写和数字，如 User01）[socksuser]: " USERNAME
-USERNAME="${USERNAME:-socksuser}"
-if ! is_username_valid "$USERNAME"; then
-  echo "用户名不合法：$USERNAME"
-  echo "允许：大小写字母/数字/_/-；首字符必须是字母或下划线；长度<=31"
-  exit 1
+# 随机用户名和密码
+USERNAME="socks$(tr -dc 'a-z' </dev/urandom | head -c 4)"
+PASSWORD="$(tr -dc 'A-Za-z' </dev/urandom | head -c 12)"
+
+echo "即将创建的 SOCKS5 账号：$USERNAME"
+echo "随机生成的密码为 12 位大小写字母。"
+
+# 安装 Dante
+SERVICE_NAME="danted"
+
+case "$ID" in
+  debian|ubuntu)
+    echo "使用 APT 安装 dante-server..."
+    apt update
+    apt install -y dante-server
+    ;;
+
+  alpine)
+    echo "使用 APK 安装 dante-server..."
+    apk update
+    apk add dante-server
+    ;;
+
+  *)
+    echo "暂不支持此系统: $ID"
+    exit 1
+    ;;
+esac
+
+# 找到 nologin 路径
+if command -v nologin >/dev/null 2>&1; then
+  NOLOGIN_BIN="$(command -v nologin)"
+elif [ -x /usr/sbin/nologin ]; then
+  NOLOGIN_BIN="/usr/sbin/nologin"
+elif [ -x /sbin/nologin ]; then
+  NOLOGIN_BIN="/sbin/nologin"
+else
+  NOLOGIN_BIN="/bin/false"
 fi
 
-read -rsp "请输入 SOCKS5 密码（不回显，支持大小写和数字）: " PASSWORD
-echo
-if [[ -z "${PASSWORD}" ]]; then
-  echo "密码不能为空"
-  exit 1
-fi
-read -rsp "请再次输入密码确认: " PASSWORD2
-echo
-if [[ "${PASSWORD}" != "${PASSWORD2}" ]]; then
-  echo "两次输入的密码不一致"
-  exit 1
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-
-echo "[1/7] 安装 dante-server / iproute2 / curl ..."
-apt-get update -y
-apt-get install -y dante-server iproute2 curl
-
-echo "[2/7] 自动检测默认出口网卡与 IPv4（用于 external 绑定）..."
-IFACE="$(detect_default_iface || true)"
-if [[ -z "${IFACE}" ]]; then
-  echo "未能检测到默认路由网卡，请检查：ip -4 route show default"
-  exit 1
+# 创建系统用户(无家目录无登录)
+if id -u "$USERNAME" >/dev/null 2>&1; then
+  echo "系统用户 $USERNAME 已存在，跳过创建。"
+else
+  if command -v useradd >/dev/null 2>&1; then
+    useradd -M -s "$NOLOGIN_BIN" "$USERNAME"
+  elif command -v adduser >/dev/null 2>&1; then
+    # Alpine 的 adduser
+    adduser -D -H -s "$NOLOGIN_BIN" "$USERNAME"
+  else
+    echo "系统中没有 useradd/adduser，无法创建用户。"
+    exit 1
+  fi
 fi
 
-IP="$(detect_iface_ipv4 "${IFACE}" || true)"
-if [[ -z "${IP}" ]]; then
-  echo "未能检测到网卡 ${IFACE} 的 IPv4 地址，请检查：ip -4 addr show dev ${IFACE}"
-  exit 1
-fi
+echo "$USERNAME:$PASSWORD" | chpasswd
 
-echo "默认网卡: ${IFACE}"
-echo "IPv4: ${IP}"
-
-echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证；新语法；取消日志) ..."
+# 生成 danted 配置
 cat >/etc/danted.conf <<EOF
-# Listen on all interfaces
-internal: 0.0.0.0 port = ${PORT}
+logoutput: syslog
 
-# Outgoing bind
-external: ${IP}
+internal: 0.0.0.0 port = $PORT
+internal: ::0 port = $PORT
+external: 0.0.0.0
 
-# Authentication (new keyword)
-socksmethod: username
-clientmethod: none
-
+method: username
 user.privileged: root
 user.notprivileged: nobody
+user.libwrap: nobody
 
-# Client rules
+# 允许所有客户端连接到本机的 SOCKS 端口
 client pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
 }
 
-client block {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-}
-
-# SOCKS rules (new block name)
+# 允许 TCP + UDP 转发
 socks pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  command: connect bind udpassociate
-}
-
-socks block {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: connect udp_associate
+    log: connect disconnect error
 }
 EOF
 
-echo "[4/7] 创建/更新系统用户并设置密码 ..."
-if id -u "$USERNAME" >/dev/null 2>&1; then
-  echo "用户已存在：$USERNAME（将重置密码）"
+echo "已写入配置文件 /etc/danted.conf"
+
+# 启动并设置开机自启
+if [ "$ID" = "alpine" ]; then
+  echo "使用 OpenRC 管理服务..."
+  rc-update add "$SERVICE_NAME" default || true
+  rc-service "$SERVICE_NAME" restart
 else
-  if useradd --help 2>&1 | grep -q -- '--badnames'; then
-    useradd --badnames -m -s /usr/sbin/nologin "$USERNAME"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
   else
-    useradd -m -s /usr/sbin/nologin "$USERNAME"
+    # 兼容老系统
+    if command -v service >/dev/null 2>&1; then
+      service "$SERVICE_NAME" restart
+    elif [ -x "/etc/init.d/$SERVICE_NAME" ]; then
+      "/etc/init.d/$SERVICE_NAME" restart
+    else
+      echo "找不到服务管理命令，请手工重启 $SERVICE_NAME 服务。"
+    fi
   fi
-  echo "已创建用户：$USERNAME"
-fi
-echo "${USERNAME}:${PASSWORD}" | chpasswd
-
-echo "[5/7] 校验配置 ..."
-danted -V -f /etc/danted.conf
-
-echo "[6/7] 启动 danted（不使用 systemctl；取消日志）..."
-# 先停掉可能存在的 danted
-pkill danted >/dev/null 2>&1 || true
-
-# 再确保端口不被占用（哪怕是别的进程）
-kill_port_listeners "${PORT}"
-
-# 后台启动
-danted -f /etc/danted.conf -D
-
-sleep 0.8
-
-echo "[7/7] 检测监听 ..."
-LISTEN_OK="no"
-if ss -lntp 2>/dev/null | grep -q ":${PORT}\b"; then
-  LISTEN_OK="yes"
 fi
 
 echo
-echo "================= SOCKS5 搭建完成 ================="
-echo "协议: SOCKS5 (Dante)"
-echo "监听端口: ${PORT}"
-echo "external 出口IP: ${IP}"
-echo "默认网卡: ${IFACE}"
-echo "用户名: ${USERNAME}"
-echo "密码: ${PASSWORD}"
-echo "UDP: 已允许 (外部使用需映射/放行 UDP 端口)"
-echo "监听状态: ${LISTEN_OK}"
+echo "================ 安装完成 ================"
+echo "SOCKS5 服务器已配置完成（支持 UDP）。"
+echo "服务器 IP: 你的服务器公网IP"
+echo "端口    : $PORT"
+echo "用户名  : $USERNAME"
+echo "密码    : $PASSWORD"
 echo
-echo "容器内测试："
-echo "  curl -v --socks5-hostname ${USERNAME}:${PASSWORD}@127.0.0.1:${PORT} https://ifconfig.me"
-echo
-echo "停止："
-echo "  pkill danted"
-echo "===================================================="
+echo "在客户端中选择 SOCKS5 + 用户名密码认证，并填写以上信息即可。"
+echo "如有防火墙（iptables/ufw/security-group），记得放行端口 $PORT。"
+echo "========================================="
