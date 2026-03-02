@@ -19,6 +19,16 @@ is_username_valid() {
   [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]
 }
 
+detect_default_iface() {
+  # 从默认路由中拿 dev
+  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+detect_iface_ipv4() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1
+}
+
 need_root
 
 echo "=== Dante SOCKS5 安装脚本（手动输入账号密码，适用于容器/无 systemd）==="
@@ -57,21 +67,27 @@ echo "[1/7] 安装 dante-server / iproute2 / curl ..."
 apt-get update -y
 apt-get install -y dante-server iproute2 curl
 
-echo "[2/7] 检测 eth0 IPv4 地址（用于 external 绑定）..."
-IP="$(ip -4 addr show dev eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1 || true)"
-echo "$IP"
-if [[ -z "${IP}" ]]; then
-  echo "未能检测到 eth0 的 IPv4 地址（external 不能用 0.0.0.0），请检查：ip -4 addr show dev eth0"
+echo "[2/7] 自动检测默认出口网卡与 IPv4（用于 external 绑定）..."
+IFACE="$(detect_default_iface || true)"
+if [[ -z "${IFACE}" ]]; then
+  echo "未能检测到默认路由网卡，请检查：ip -4 route show default"
   exit 1
 fi
 
-echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证) ..."
-cat >/etc/danted.conf <<EOF
-logoutput: stdout
+IP="$(detect_iface_ipv4 "${IFACE}" || true)"
+if [[ -z "${IP}" ]]; then
+  echo "未能检测到网卡 ${IFACE} 的 IPv4 地址，请检查：ip -4 addr show dev ${IFACE}"
+  exit 1
+fi
 
+echo "默认网卡: ${IFACE}"
+echo "IPv4: ${IP}"
+
+echo "[3/7] 写入 /etc/danted.conf (TCP+UDP, username 认证；取消日志) ..."
+cat >/etc/danted.conf <<EOF
 # 对外监听端口（容器内通常用 0.0.0.0）
 internal: 0.0.0.0 port = ${PORT}
-# 出口绑定必须是具体地址/接口，这里使用检测到的 eth0 IPv4
+# 出口绑定必须是具体地址/接口，这里使用默认路由网卡的 IPv4
 external: ${IP}
 
 method: username
@@ -80,13 +96,11 @@ user.notprivileged: nobody
 
 client pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
-  log: connect disconnect error
 }
 
 pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
   protocol: tcp udp
-  log: connect disconnect error
 }
 EOF
 
@@ -108,9 +122,11 @@ echo "[5/7] 校验配置 ..."
 # 你这版 danted 用 -V 校验（不支持 -t）
 danted -V -f /etc/danted.conf
 
-echo "[6/7] 启动 danted（不使用 systemctl）..."
+echo "[6/7] 启动 danted（不使用 systemctl；取消日志输出重定向）..."
 pkill danted >/dev/null 2>&1 || true
-nohup danted -f /etc/danted.conf -D >/var/log/danted.log 2>&1 &
+
+# -D 后台运行；不再 nohup 重定向到 /var/log
+danted -f /etc/danted.conf -D
 
 sleep 0.8
 
@@ -125,6 +141,7 @@ echo "================= SOCKS5 搭建完成 ================="
 echo "协议: SOCKS5 (Dante)"
 echo "监听端口: ${PORT}"
 echo "external 出口IP: ${IP}"
+echo "默认网卡: ${IFACE}"
 echo "用户名: ${USERNAME}"
 echo "密码: ${PASSWORD}"
 echo "UDP: 已允许 (外部使用需映射/放行 UDP 端口)"
@@ -133,8 +150,6 @@ echo
 echo "容器内测试："
 echo "  curl -v --socks5-hostname ${USERNAME}:${PASSWORD}@127.0.0.1:${PORT} https://ifconfig.me"
 echo
-echo "日志查看："
-echo "  tail -n 200 /var/log/danted.log"
 echo "停止："
 echo "  pkill danted"
 echo "===================================================="
